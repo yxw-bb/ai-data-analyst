@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+aiofiles
+pyecharts
+openpyxl
+pandas
+numpy
+matplotlib
+streamlit
+requests
+python-dotenv
+openai
+pillow
