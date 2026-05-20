@@ -1,9 +1,11 @@
 """
-LLM编排：自然语言 → 生成分析代码 → 解读结果
+LLM编排：自动生成6步数据分析报告
 
-Prompt链分为两步：
-1. CodeGen：根据数据Schema + 用户问题 → 生成Python代码
-2. Interpreter：根据执行结果 → 用自然语言解读
+流程：
+1. 数据概览 → 2. 描述统计 → 3. 相关性分析
+→ 4. 趋势发现 → 5. 分组对比 → 6. 结论与建议
+
+每步独立生成代码 → 沙箱执行 → 汇总成完整报告
 """
 import os
 import pandas as pd
@@ -19,69 +21,118 @@ client = OpenAI(
 
 CHAT_MODEL = "deepseek-chat"
 
-CODE_GEN_PROMPT = """你是一个数据分析专家。用户上传了一个CSV文件，请你根据数据结构和用户问题，生成Python代码来完成分析。
+# 6个分析步骤的定义
+ANALYSIS_STEPS = [
+    {
+        "name": "数据概览",
+        "icon": "📋",
+        "prompt": """请生成Python代码，对数据做基本概览：
+1. 打印数据形状（行数×列数）
+2. 打印所有列名和数据类型
+3. 统计每列的缺失值数量和比例
+4. 打印数据内存占用
 
-## 数据结构
-- 列名：{columns}
-- 行数：{rows}
-- 前5行数据：
-{sample_data}
+要求：只用print输出，不画图。df已预加载。""",
+    },
+    {
+        "name": "描述统计",
+        "icon": "📊",
+        "prompt": """请生成Python代码，对数值列做描述统计，并画分布图：
+1. 打印数值列的：均值、中位数、标准差、最小值、最大值
+2. 为每个数值列画直方图（hist），用plt.figure()创建
+3. 画一个箱线图（boxplot）展示所有数值列的分布
 
-## 用户问题
-{question}
+要求：每个图表单独一个plt.figure()。df已预加载。""",
+    },
+    {
+        "name": "相关性分析",
+        "icon": "🔥",
+        "prompt": """请生成Python代码，分析数值列之间的相关性：
+1. 打印相关系数矩阵
+2. 画热力图（用plt.imshow或plt.matshow），标注相关系数值
+3. 找出并打印相关性最高的3对变量
 
-## 代码要求
-1. 使用变量 `df`（已预加载），不要重新读取文件
-2. 只输出Python代码，不要解释，不要markdown代码块标记
-3. 使用 `print()` 输出分析结果（描述文字 + 关键数据）
-4. 如果需要图表，使用 `plt.figure()` 创建新figure，一个figure一张图
-5. 图表要有标题、坐标轴标签（中文）
-6. 代码要健壮：处理缺失值、检查数据类型
+要求：df已预加载。用plt.figure()创建图表。""",
+    },
+    {
+        "name": "趋势发现",
+        "icon": "📈",
+        "prompt": """请生成Python代码，发现数据中的趋势：
+1. 找数据中可能是日期/时间的列，如果有，按时间排序后画折线图
+2. 如果没有日期列，对数值列画滚动均值趋势
+3. 打印发现的明显趋势或模式
 
-## 可用的库
-pandas (pd), numpy (np), matplotlib.pyplot (plt)
+要求：有日期列优先用日期列做趋势。df已预加载。""",
+    },
+    {
+        "name": "分组对比",
+        "icon": "📉",
+        "prompt": """请生成Python代码，做分组对比分析：
+1. 找数据中的分类列（字符串/类别型），选最重要的1-2个
+2. 按分类列分组，计算数值列的汇总统计（总和或均值）
+3. 画分组柱状图对比
+4. 打印Top-3和Bottom-3的分组值
 
-现在请输出代码："""
+要求：没有分类列就跳过，在print里说明。df已预加载。""",
+    },
+    {
+        "name": "结论与建议",
+        "icon": "💡",
+        "prompt": """请生成Python代码，汇总前面分析的关键发现：
+1. 打印数据质量总结（缺失情况、异常情况）
+2. 打印3-5个关键统计结论（带具体数字）
+3. 如果有明显的趋势或差异，强调出来
 
+只用print输出，不画图。df已预加载。""",
+    },
+]
 
-INTERPRETER_PROMPT = """你是一个数据分析师。请用简洁的中文解读以下分析结果。
+SUMMARY_PROMPT = """你是一位资深数据分析师。请根据以下分析结果，写一份200-300字的数据分析摘要。
 
-用户问题：{question}
-代码执行输出：{output}
+数据文件：{file_name}
+数据规模：{rows}行 × {cols}列
+列名：{columns}
 
-规则：
-1. 2-4句话总结关键发现
-2. 有数字就说数字，不要模糊
-3. 如果执行出错，解释可能的原因"""
+各步骤分析结果：
+{all_outputs}
+
+请写一份简洁的分析摘要，包含：
+1. 数据整体情况（1-2句）
+2. 最关键的2-3个发现（带数字）
+3. 1条可执行的建议
+"""
 
 
 def get_data_schema(file_path: str) -> dict:
     """读取CSV/Excel，提取Schema信息"""
     try:
         if file_path.endswith(".csv"):
-            df = pd.read_csv(file_path, encoding="utf-8-sig", nrows=5)
             full_df = pd.read_csv(file_path, encoding="utf-8-sig")
         else:
-            df = pd.read_excel(file_path, nrows=5)
             full_df = pd.read_excel(file_path)
 
         return {
-            "columns": list(df.columns),
+            "columns": list(full_df.columns),
             "rows": len(full_df),
-            "sample_data": df.to_string(),
+            "sample_data": full_df.head(5).to_string(),
         }
     except Exception as e:
         return {"columns": [], "rows": 0, "sample_data": f"读取失败：{e}"}
 
 
-def generate_code(schema: dict, question: str) -> str:
-    """根据数据Schema和用户问题，让LLM生成分析代码"""
-    prompt = CODE_GEN_PROMPT.format(
-        columns=schema["columns"],
-        rows=schema["rows"],
-        sample_data=schema["sample_data"],
-        question=question,
-    )
+def generate_step_code(schema: dict, step: dict) -> str:
+    """为单个分析步骤生成代码"""
+    prompt = f"""## 数据结构
+列名：{schema['columns']}
+行数：{schema['rows']}
+前5行：
+{schema['sample_data']}
+
+## 任务
+{step['prompt']}
+
+## 输出规则
+只输出Python代码，不要markdown包裹，不要解释。"""
 
     response = client.chat.completions.create(
         model=CHAT_MODEL,
@@ -89,34 +140,30 @@ def generate_code(schema: dict, question: str) -> str:
         temperature=0.1,
         max_tokens=2000,
     )
-
     code = response.choices[0].message.content.strip()
-
-    # 清洗：去掉可能的markdown包裹
-    if code.startswith("```python"):
-        code = code[9:]
     if code.startswith("```"):
-        code = code[3:]
-    if code.endswith("```"):
-        code = code[:-3]
-
-    return code.strip()
+        code = "\n".join(code.split("\n")[1:-1])
+    return code
 
 
-def interpret_result(question: str, output: str) -> str:
-    """让LLM用自然语言解读分析结果"""
-    if not output or not output.strip():
-        return "分析完成，请查看图表和输出数据。"
-    try:
-        response = client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=[{
-                "role": "user",
-                "content": INTERPRETER_PROMPT.format(question=question, output=output),
-            }],
-            temperature=0.3,
-            max_tokens=500,
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        return f"解读生成失败：{e}"
+def generate_summary(file_name: str, schema: dict, all_outputs: str) -> str:
+    """生成分析摘要"""
+    if not all_outputs.strip():
+        return "无法生成摘要：分析未产生有效输出。"
+
+    response = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[{
+            "role": "user",
+            "content": SUMMARY_PROMPT.format(
+                file_name=file_name,
+                rows=schema["rows"],
+                cols=len(schema["columns"]),
+                columns=", ".join(schema["columns"]),
+                all_outputs=all_outputs[:4000],  # 截断避免超token
+            ),
+        }],
+        temperature=0.3,
+        max_tokens=600,
+    )
+    return response.choices[0].message.content.strip()

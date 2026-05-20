@@ -1,20 +1,19 @@
-"""FastAPI后端：文件上传、分析请求、历史查询"""
+"""FastAPI后端：上传数据 → 自动生成6步分析报告"""
 import os
 import shutil
 import uuid
+import pandas as pd
 from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 
-from backend.llm import get_data_schema, generate_code, interpret_result
+from backend.llm import get_data_schema, generate_step_code, generate_summary, ANALYSIS_STEPS
 from backend.sandbox import execute_code
 from backend.database import init_db, save_analysis, get_history
 
-app = FastAPI(title="AI数据分析工作台", version="1.0")
+app = FastAPI(title="AI数据洞察报告生成器", version="2.0")
 
-# 允许跨域（Streamlit前端调用）
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,7 +32,7 @@ def startup():
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
-    """上传CSV/Excel，返回文件ID和Schema"""
+    """上传CSV/Excel"""
     if not file.filename.endswith((".csv", ".xlsx", ".xls")):
         raise HTTPException(400, "仅支持CSV和Excel文件")
 
@@ -58,57 +57,87 @@ async def upload_file(file: UploadFile = File(...)):
     }
 
 
-@app.post("/api/analyze")
-async def analyze(file_id: str = Form(...), question: str = Form(...)):
-    """分析数据：生成代码 → 沙箱执行 → 解读结果"""
-    # 找到上传的文件
+@app.post("/api/generate-report")
+async def generate_report(file_id: str = Form(...)):
+    """执行6步分析，返回完整报告"""
     matches = list(UPLOAD_DIR.glob(f"{file_id}.*"))
     if not matches:
-        raise HTTPException(404, "文件不存在，请重新上传")
+        raise HTTPException(404, "文件不存在")
     file_path = str(matches[0])
+    file_name = Path(matches[0]).name
 
-    # Step 1: 获取数据Schema
     schema = get_data_schema(file_path)
     if not schema["columns"]:
-        raise HTTPException(400, "无法解析数据文件")
+        raise HTTPException(400, "无法解析数据")
 
-    # Step 2: LLM生成代码
-    code = generate_code(schema, question)
+    # 逐步执行分析
+    steps_result = []
+    all_outputs = ""
 
-    # Step 3: 沙箱执行
-    result = execute_code(code, file_path)
+    for step in ANALYSIS_STEPS:
+        try:
+            code = generate_step_code(schema, step)
+            result = execute_code(code, file_path)
 
-    # Step 4: 解读结果
-    interpretation = ""
-    if result["output"] and not result["error"]:
-        interpretation = interpret_result(question, result["output"])
+            if result["error"]:
+                # 部分步骤失败不中断
+                steps_result.append({
+                    "name": step["name"],
+                    "icon": step["icon"],
+                    "code": code,
+                    "output": f"执行出错：{result['error']}",
+                    "charts": [],
+                    "error": result["error"],
+                })
+            else:
+                steps_result.append({
+                    "name": step["name"],
+                    "icon": step["icon"],
+                    "code": code,
+                    "output": result["output"],
+                    "charts": result["charts"],
+                    "error": None,
+                })
+                all_outputs += f"\n=== {step['name']} ===\n{result['output']}\n"
 
-    # Step 5: 存历史
+        except Exception as e:
+            steps_result.append({
+                "name": step["name"],
+                "icon": step["icon"],
+                "code": "",
+                "output": f"生成失败：{str(e)}",
+                "charts": [],
+                "error": str(e),
+            })
+
+    # 生成摘要
+    summary = generate_summary(file_name, schema, all_outputs)
+
+    # 存入数据库
     analysis_id = save_analysis(
-        file_name=matches[0].name,
-        question=question,
-        code=code,
-        output=result["output"],
-        interpretation=interpretation,
-        charts=result["charts"],
+        file_name=file_name,
+        question="[自动报告生成]",
+        code=str([s["name"] for s in steps_result]),
+        output=all_outputs[:500],
+        interpretation=summary,
+        charts=[],
     )
 
     return {
         "analysis_id": analysis_id,
-        "code": code,
-        "output": result["output"],
-        "charts": result["charts"],
-        "interpretation": interpretation,
-        "error": result["error"],
+        "file_name": file_name,
+        "rows": schema["rows"],
+        "columns": len(schema["columns"]),
+        "summary": summary,
+        "steps": steps_result,
     }
 
 
 @app.get("/api/history")
 async def history(limit: int = 20):
-    """查询历史分析记录"""
     return {"history": get_history(limit)}
 
 
 @app.get("/")
 async def root():
-    return {"service": "AI数据分析工作台", "version": "1.0"}
+    return {"service": "AI数据洞察报告生成器", "version": "2.0"}

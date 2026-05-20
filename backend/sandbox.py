@@ -37,6 +37,9 @@ from io import BytesIO
 import json
 import os
 
+# 禁用plt.show()——非交互模式下会报warning
+plt.show = lambda: None
+
 # 配置中文字体（Windows系统）
 _font_paths = [
     'C:/Windows/Fonts/simhei.ttf',
@@ -112,7 +115,20 @@ def execute_code(code: str, data_path: str) -> dict:
         )
 
         output = result.stdout
-        error = result.stderr if result.stderr else None
+        # 过滤warning，只保留真正的错误
+        stderr = result.stderr
+        if stderr:
+            real_errors = [l for l in stderr.split("\n") if l.strip()
+                          and "Warning" not in l
+                          and "FutureWarning" not in l
+                          and "DeprecationWarning" not in l
+                          and "plt.show()" not in l
+                          and "pandas.pydata.org" not in l
+                          and "select_dtypes" not in l
+                          and "FigureCanvasAgg" not in l]
+            error = "\n".join(real_errors) if real_errors else None
+        else:
+            error = None
 
         # 解析图表
         charts = []
